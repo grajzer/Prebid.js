@@ -1,4 +1,4 @@
-import { _each } from '../src/utils.js';
+import { _each, buildUrl, deepAccess, pick, triggerPixel } from '../src/utils.js';
 import { config } from '../src/config.js';
 import { registerBidder } from '../src/adapters/bidderFactory.js';
 import { getStorageManager } from '../src/storageManager.js';
@@ -7,10 +7,11 @@ import { BANNER, VIDEO } from '../src/mediaTypes.js';
 const BIDDER_CODE = 'kargo';
 const HOST = 'https://krk.kargo.com';
 const SYNC = 'https://crb.kargo.com/api/v1/initsyncrnd/{UUID}?seed={SEED}&idx={INDEX}&gdpr={GDPR}&gdpr_consent={GDPR_CONSENT}&us_privacy={US_PRIVACY}';
+const PREBID_VERSION = '$prebid.version$';
 const SYNC_COUNT = 5;
 const GVLID = 972;
-const SUPPORTED_MEDIA_TYPES = [BANNER, VIDEO]
-const storage = getStorageManager({gvlid: GVLID, bidderCode: BIDDER_CODE});
+const SUPPORTED_MEDIA_TYPES = [BANNER, VIDEO];
+const storage = getStorageManager({bidderCode: BIDDER_CODE});
 
 let sessionId,
   lastPageUrl,
@@ -37,10 +38,9 @@ export const spec = {
       bidSizes[bid.bidId] = bid.sizes;
     });
 
-    let tdid;
-    if (validBidRequests.length > 0 && validBidRequests[0].userId && validBidRequests[0].userId.tdid) {
-      tdid = validBidRequests[0].userId.tdid;
-    }
+    const firstBidRequest = validBidRequests[0];
+
+    const tdid = deepAccess(firstBidRequest, 'userId.tdid')
 
     const transformedParams = Object.assign({}, {
       sessionId: spec._getSessionId(),
@@ -55,8 +55,27 @@ export const spec = {
       },
       bidIDs,
       bidSizes,
-      prebidRawBidRequests: validBidRequests
-    }, spec._getAllMetadata(tdid, bidderRequest.uspConsent, bidderRequest.gdprConsent));
+      device: {
+        width: window.screen.width,
+        height: window.screen.height
+      },
+      prebidRawBidRequests: validBidRequests,
+      prebidVersion: PREBID_VERSION
+    }, spec._getAllMetadata(bidderRequest, tdid));
+
+    // User Agent Client Hints / SUA
+    const uaClientHints = deepAccess(firstBidRequest, 'ortb2.device.sua');
+    if (uaClientHints) {
+      transformedParams.device.sua = pick(uaClientHints, ['browsers', 'platform', 'mobile', 'model']);
+    }
+
+    // Pull Social Canvas segments and embed URL
+    const socialCanvas = deepAccess(firstBidRequest, 'params.socialCanvas');
+    if (socialCanvas) {
+      transformedParams.socialCanvasSegments = socialCanvas.segments;
+      transformedParams.socialEmbedURL = socialCanvas.embedURL;
+    }
+
     const encodedParams = encodeURIComponent(JSON.stringify(transformedParams));
     return Object.assign({}, bidderRequest, {
       method: 'GET',
@@ -70,27 +89,45 @@ export const spec = {
     const bidResponses = [];
     for (let bidId in bids) {
       let adUnit = bids[bidId];
-      let meta;
+      let meta = {
+        mediaType: BANNER
+      };
+
       if (adUnit.metadata && adUnit.metadata.landingPageDomain) {
-        meta = {
-          clickUrl: adUnit.metadata.landingPageDomain[0],
-          advertiserDomains: adUnit.metadata.landingPageDomain
-        };
+        meta.clickUrl = adUnit.metadata.landingPageDomain[0];
+        meta.advertiserDomains = adUnit.metadata.landingPageDomain;
       }
-      bidResponses.push({
+
+      if (adUnit.mediaType && SUPPORTED_MEDIA_TYPES.includes(adUnit.mediaType)) {
+        meta.mediaType = adUnit.mediaType;
+      }
+
+      const bidResponse = {
+        ad: adUnit.adm,
         requestId: bidId,
         cpm: Number(adUnit.cpm),
         width: adUnit.width,
         height: adUnit.height,
-        ad: adUnit.adm,
         ttl: 300,
         creativeId: adUnit.id,
         dealId: adUnit.targetingCustom,
         netRevenue: true,
         currency: adUnit.currency || bidRequest.currency,
+        mediaType: meta.mediaType,
         meta: meta
-      });
+      };
+
+      if (meta.mediaType == VIDEO) {
+        if (adUnit.admUrl) {
+          bidResponse.vastUrl = adUnit.admUrl;
+        } else {
+          bidResponse.vastXml = adUnit.adm;
+        }
+      }
+
+      bidResponses.push(bidResponse);
     }
+
     return bidResponses;
   },
   getUserSyncs: function(syncOptions, responses, gdprConsent, usPrivacy) {
@@ -118,32 +155,19 @@ export const spec = {
     return syncs;
   },
   supportedMediaTypes: SUPPORTED_MEDIA_TYPES,
-
-  // PRIVATE
-  _readCookie(name) {
-    if (!storage.cookiesAreEnabled()) {
-      return null;
-    }
-    let nameEquals = `${name}=`;
-    let cookies = document.cookie.split(';');
-
-    for (let i = 0; i < cookies.length; i++) {
-      let cookie = cookies[i];
-      while (cookie.charAt(0) === ' ') {
-        cookie = cookie.substring(1, cookie.length);
-      }
-
-      if (cookie.indexOf(nameEquals) === 0) {
-        return cookie.substring(nameEquals.length, cookie.length);
-      }
+  onTimeout: function(timeoutData) {
+    if (timeoutData == null) {
+      return;
     }
 
-    return null;
+    timeoutData.forEach((bid) => {
+      this._sendTimeoutData(bid.auctionId, bid.timeout);
+    });
   },
 
   _getCrbFromCookie() {
     try {
-      const crb = JSON.parse(decodeURIComponent(spec._readCookie('krg_crb')));
+      const crb = JSON.parse(storage.getCookie('krg_crb'));
       if (crb && crb.v) {
         let vParsed = JSON.parse(atob(crb.v));
         if (vParsed) {
@@ -210,11 +234,11 @@ export const spec = {
     return crb.clientId;
   },
 
-  _getAllMetadata(tdid, usp, gdpr) {
+  _getAllMetadata(bidderRequest, tdid) {
     return {
-      userIDs: spec._getUserIds(tdid, usp, gdpr),
-      pageURL: window.location.href,
-      rawCRB: spec._readCookie('krg_crb'),
+      userIDs: spec._getUserIds(tdid, bidderRequest.uspConsent, bidderRequest.gdprConsent),
+      pageURL: bidderRequest?.refererInfo?.page,
+      rawCRB: storage.getCookie('krg_crb'),
       rawCRBLocalStorage: spec._getLocalStorageSafely('krg_crb')
     };
   },
@@ -248,6 +272,24 @@ export const spec = {
     } catch (e) {
       return '';
     }
+  },
+
+  _sendTimeoutData(auctionId, auctionTimeout) {
+    let params = {
+      aid: auctionId,
+      ato: auctionTimeout,
+    };
+
+    try {
+      let timeoutRequestUrl = buildUrl({
+        protocol: 'https',
+        hostname: 'krk.kargo.com',
+        pathname: '/api/v1/event/timeout',
+        search: params
+      });
+
+      triggerPixel(timeoutRequestUrl);
+    } catch (e) {}
   }
 };
 registerBidder(spec);

@@ -9,21 +9,23 @@ import { timestamp, parseUrl, triggerPixel, logError } from '../src/utils.js';
 import { ajax } from '../src/ajax.js';
 import { getRefererInfo } from '../src/refererDetection.js';
 import { submodule } from '../src/hook.js';
-import { getStorageManager } from '../src/storageManager.js';
+import {getStorageManager} from '../src/storageManager.js';
+import {MODULE_TYPE_UID} from '../src/activities/modules.js';
 
 const gvlid = 91;
 const bidderCode = 'criteo';
-export const storage = getStorageManager({gvlid: gvlid, moduleName: bidderCode});
+export const storage = getStorageManager({moduleType: MODULE_TYPE_UID, moduleName: bidderCode});
 
 const bididStorageKey = 'cto_bidid';
 const bundleStorageKey = 'cto_bundle';
+const dnaBundleStorageKey = 'cto_dna_bundle';
 const cookiesMaxAge = 13 * 30 * 24 * 60 * 60 * 1000;
 
 const pastDateString = new Date(0).toString();
 const expirationString = new Date(timestamp() + cookiesMaxAge).toString();
 
-function extractProtocolHost (url, returnOnlyHost = false) {
-  const parsedUrl = parseUrl(url, {noDecodeWholeURL: true})
+function extractProtocolHost(url, returnOnlyHost = false) {
+  const parsedUrl = parseUrl(url, { noDecodeWholeURL: true })
   return returnOnlyHost
     ? `${parsedUrl.hostname}`
     : `${parsedUrl.protocol}://${parsedUrl.hostname}${parsedUrl.port ? ':' + parsedUrl.port : ''}/`;
@@ -70,15 +72,17 @@ function deleteFromAllStorages(key, hostname) {
 function getCriteoDataFromAllStorages() {
   return {
     bundle: getFromAllStorages(bundleStorageKey),
+    dnaBundle: getFromAllStorages(dnaBundleStorageKey),
     bidId: getFromAllStorages(bididStorageKey),
   }
 }
 
-function buildCriteoUsersyncUrl(topUrl, domain, bundle, areCookiesWriteable, isLocalStorageWritable, isPublishertagPresent, gdprString) {
+function buildCriteoUsersyncUrl(topUrl, domain, bundle, dnaBundle, areCookiesWriteable, isLocalStorageWritable, isPublishertagPresent, gdprString) {
   const url = 'https://gum.criteo.com/sid/json?origin=prebid' +
     `${topUrl ? '&topUrl=' + encodeURIComponent(topUrl) : ''}` +
     `${domain ? '&domain=' + encodeURIComponent(domain) : ''}` +
     `${bundle ? '&bundle=' + encodeURIComponent(bundle) : ''}` +
+    `${dnaBundle ? '&info=' + encodeURIComponent(dnaBundle) : ''}` +
     `${gdprString ? '&gdprString=' + encodeURIComponent(gdprString) : ''}` +
     `${areCookiesWriteable ? '&cw=1' : ''}` +
     `${isPublishertagPresent ? '&pbt=1' : ''}` +
@@ -87,10 +91,36 @@ function buildCriteoUsersyncUrl(topUrl, domain, bundle, areCookiesWriteable, isL
   return url;
 }
 
+function callSyncPixel(domain, pixel) {
+  if (pixel.writeBundleInStorage && pixel.bundlePropertyName && pixel.storageKeyName) {
+    ajax(
+      pixel.pixelUrl,
+      {
+        success: response => {
+          if (response) {
+            const jsonResponse = JSON.parse(response);
+            if (jsonResponse && jsonResponse[pixel.bundlePropertyName]) {
+              saveOnAllStorages(pixel.storageKeyName, jsonResponse[pixel.bundlePropertyName], domain);
+            }
+          }
+        },
+        error: error => {
+          logError(`criteoIdSystem: unable to sync user id`, error);
+        }
+      },
+      undefined,
+      { method: 'GET', withCredentials: true }
+    );
+  } else {
+    triggerPixel(pixel.pixelUrl);
+  }
+}
+
 function callCriteoUserSync(parsedCriteoData, gdprString, callback) {
   const cw = storage.cookiesAreEnabled();
   const lsw = storage.localStorageIsEnabled();
-  const topUrl = extractProtocolHost(getRefererInfo().referer);
+  const topUrl = extractProtocolHost(getRefererInfo().page);
+  // TODO: should domain really be extracted from the current frame?
   const domain = extractProtocolHost(document.location.href, true);
   const isPublishertagPresent = typeof criteo_pubtag !== 'undefined'; // eslint-disable-line camelcase
 
@@ -98,6 +128,7 @@ function callCriteoUserSync(parsedCriteoData, gdprString, callback) {
     topUrl,
     domain,
     parsedCriteoData.bundle,
+    parsedCriteoData.dnaBundle,
     cw,
     lsw,
     isPublishertagPresent,
@@ -107,6 +138,11 @@ function callCriteoUserSync(parsedCriteoData, gdprString, callback) {
   const callbacks = {
     success: response => {
       const jsonResponse = JSON.parse(response);
+
+      if (jsonResponse.pixels) {
+        jsonResponse.pixels.forEach(pixel => callSyncPixel(domain, pixel));
+      }
+
       if (jsonResponse.acwsUrl) {
         const urlsToCall = typeof jsonResponse.acwsUrl === 'string' ? [jsonResponse.acwsUrl] : jsonResponse.acwsUrl;
         urlsToCall.forEach(url => triggerPixel(url));

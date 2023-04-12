@@ -1,6 +1,8 @@
 import {registerBidder} from '../src/adapters/bidderFactory.js';
 import {triggerPixel} from '../src/utils.js';
 import {NATIVE} from '../src/mediaTypes.js';
+import {config} from '../src/config.js';
+import { convertOrtbRequestToProprietaryNative } from '../src/native.js';
 
 const BIDDER_CODE = 'adrino';
 const REQUEST_METHOD = 'POST';
@@ -11,6 +13,10 @@ export const spec = {
   code: BIDDER_CODE,
   gvlid: GVLID,
   supportedMediaTypes: [NATIVE],
+
+  getBidderConfig: function (property) {
+    return config.getConfig(`${BIDDER_CODE}.${property}`);
+  },
 
   isBidRequestValid: function (bid) {
     return !!(bid.bidId) &&
@@ -23,14 +29,17 @@ export const spec = {
   },
 
   buildRequests: function (validBidRequests, bidderRequest) {
-    const bidRequests = [];
+    // convert Native ORTB definition to old-style prebid native definition
+    validBidRequests = convertOrtbRequestToProprietaryNative(validBidRequests);
 
+    let bids = [];
     for (let i = 0; i < validBidRequests.length; i++) {
       let requestData = {
         bidId: validBidRequests[i].bidId,
         nativeParams: validBidRequests[i].nativeParams,
         placementHash: validBidRequests[i].params.hash,
-        referer: bidderRequest.refererInfo.referer,
+        userId: validBidRequests[i].userId,
+        referer: bidderRequest.refererInfo.page,
         userAgent: navigator.userAgent,
       }
 
@@ -41,32 +50,43 @@ export const spec = {
         }
       }
 
-      bidRequests.push({
-        method: REQUEST_METHOD,
-        url: BIDDER_HOST + '/bidder/bid/',
-        data: requestData,
-        options: {
-          contentType: 'application/json',
-          withCredentials: false,
-        }
-      });
+      bids.push(requestData);
     }
+
+    let host = this.getBidderConfig('host') || BIDDER_HOST;
+    let bidRequests = [];
+    bidRequests.push({
+      method: REQUEST_METHOD,
+      url: host + '/bidder/bids/',
+      data: bids,
+      options: {
+        contentType: 'application/json',
+        withCredentials: false,
+      }
+    });
 
     return bidRequests;
   },
 
   interpretResponse: function (serverResponse, bidRequest) {
     const response = serverResponse.body;
-    const bidResponses = [];
-    if (!response.noAd) {
-      bidResponses.push(response);
+    const output = [];
+
+    if (response.bidResponses) {
+      for (const bidResponse of response.bidResponses) {
+        if (!bidResponse.noAd) {
+          output.push(bidResponse);
+        }
+      }
     }
-    return bidResponses;
+
+    return output;
   },
 
   onBidWon: function (bid) {
     if (bid['requestId']) {
-      triggerPixel(BIDDER_HOST + '/bidder/won/' + bid['requestId']);
+      let host = this.getBidderConfig('host') || BIDDER_HOST;
+      triggerPixel(host + '/bidder/won/' + bid['requestId']);
     }
   }
 };
